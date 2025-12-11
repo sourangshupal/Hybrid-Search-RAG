@@ -12,6 +12,7 @@ from src.embeddings.bge_embedder import BGEEmbedder
 from src.retrieval.qdrant_client import QdrantClient
 from src.retrieval.elasticsearch_client import ElasticsearchClient
 from src.retrieval.query_processor import QueryProcessor
+from src.reranking.cohere_reranker import CohereReranker
 from src.core.exceptions import HybridSearchError
 
 
@@ -39,6 +40,8 @@ class HybridSearchResult:
     lexical_count: int
     fusion_method: str
     execution_time_ms: float
+    reranked: bool = False
+    reranking_time_ms: Optional[float] = None
 
 
 class HybridSearchEngine:
@@ -50,6 +53,7 @@ class HybridSearchEngine:
         qdrant_client: QdrantClient,
         elasticsearch_client: ElasticsearchClient,
         query_processor: Optional[QueryProcessor] = None,
+        reranker: Optional[CohereReranker] = None,
         k: int = 60,  # RRF constant
         semantic_weight: float = 0.5,
         lexical_weight: float = 0.5
@@ -62,6 +66,7 @@ class HybridSearchEngine:
             qdrant_client: Qdrant client for semantic search
             elasticsearch_client: Elasticsearch client for lexical search
             query_processor: Query processor (creates default if None)
+            reranker: Optional Cohere reranker for result reranking
             k: RRF constant (default: 60 from paper)
             semantic_weight: Weight for semantic search results
             lexical_weight: Weight for lexical search results
@@ -70,13 +75,15 @@ class HybridSearchEngine:
         self.qdrant_client = qdrant_client
         self.elasticsearch_client = elasticsearch_client
         self.query_processor = query_processor or QueryProcessor()
+        self.reranker = reranker
         self.k = k
         self.semantic_weight = semantic_weight
         self.lexical_weight = lexical_weight
 
         logger.info(
             f"Initialized HybridSearchEngine (k={k}, "
-            f"semantic_weight={semantic_weight}, lexical_weight={lexical_weight})"
+            f"semantic_weight={semantic_weight}, lexical_weight={lexical_weight}, "
+            f"reranker={'enabled' if reranker else 'disabled'})"
         )
 
     async def search(
@@ -87,7 +94,9 @@ class HybridSearchEngine:
         use_rrf: bool = True,
         semantic_only: bool = False,
         lexical_only: bool = False,
-        include_explanation: bool = True
+        include_explanation: bool = True,
+        rerank_results: bool = True,
+        rerank_top_n: Optional[int] = None
     ) -> HybridSearchResult:
         """
         Execute hybrid search.
@@ -100,6 +109,8 @@ class HybridSearchEngine:
             semantic_only: Use only semantic search
             lexical_only: Use only lexical search
             include_explanation: Include explanation for each result
+            rerank_results: Apply reranking if reranker is available
+            rerank_top_n: Number of top results to rerank (None = rerank all)
 
         Returns:
             HybridSearchResult with fused results
@@ -161,6 +172,16 @@ class HybridSearchEngine:
             # Deduplicate results
             results = self._deduplicate_results(results)
 
+            # Apply reranking if requested and available
+            reranked = False
+            reranking_time_ms = None
+            if rerank_results and self.reranker and results:
+                reranked, reranking_time_ms = await self._apply_reranking(
+                    query, results, rerank_top_n or len(results)
+                )
+                if reranked:
+                    results = reranked
+
             # Limit to requested count
             results = results[:limit]
 
@@ -176,7 +197,7 @@ class HybridSearchEngine:
 
             logger.info(
                 f"Found {len(results)} results in {execution_time_ms:.1f}ms "
-                f"(semantic={semantic_count}, lexical={lexical_count})"
+                f"(semantic={semantic_count}, lexical={lexical_count}, reranked={bool(reranked)})"
             )
 
             return HybridSearchResult(
@@ -186,7 +207,9 @@ class HybridSearchEngine:
                 semantic_count=semantic_count,
                 lexical_count=lexical_count,
                 fusion_method=fusion_method,
-                execution_time_ms=execution_time_ms
+                execution_time_ms=execution_time_ms,
+                reranked=bool(reranked),
+                reranking_time_ms=reranking_time_ms
             )
 
         except Exception as e:
@@ -515,6 +538,86 @@ class HybridSearchEngine:
             result.explanation = " | ".join(explanation_parts)
 
         return results
+
+    async def _apply_reranking(
+        self,
+        query: str,
+        results: List[SearchResult],
+        top_n: int
+    ) -> Tuple[Optional[List[SearchResult]], Optional[float]]:
+        """
+        Apply reranking to search results.
+
+        Args:
+            query: Search query
+            results: List of search results
+            top_n: Number of top results to rerank
+
+        Returns:
+            Tuple of (reranked_results, reranking_time_ms) or (None, None) if failed
+        """
+        try:
+            import time
+            rerank_start = time.time()
+
+            # Convert SearchResult objects to dict format for reranker
+            search_results_dicts = []
+            for result in results[:top_n]:
+                search_results_dicts.append({
+                    "id": result.id,
+                    "score": result.score,
+                    "content": result.content,
+                    "metadata": result.metadata
+                })
+
+            # Rerank with fallback
+            reranked_dicts = await self.reranker.rerank_with_fallback(
+                query=query,
+                search_results=search_results_dicts,
+                content_field="content",
+                top_n=None,  # Rerank all provided results
+                normalize_scores=True,
+                fallback_to_original=True
+            )
+
+            reranking_time_ms = (time.time() - rerank_start) * 1000
+
+            # Convert back to SearchResult objects
+            reranked_results = []
+            for reranked_dict in reranked_dicts:
+                # Find original result to get all fields
+                original = next(
+                    (r for r in results if r.id == reranked_dict["id"]),
+                    None
+                )
+                if original:
+                    # Create new SearchResult with updated score
+                    reranked_results.append(SearchResult(
+                        id=original.id,
+                        score=reranked_dict.get("score", original.score),
+                        content=original.content,
+                        metadata=original.metadata,
+                        source=original.source,
+                        rank=original.rank,
+                        explanation=original.explanation
+                    ))
+
+            # Append any results that weren't reranked (if top_n < len(results))
+            if len(results) > top_n:
+                reranked_ids = {r.id for r in reranked_results}
+                for result in results[top_n:]:
+                    if result.id not in reranked_ids:
+                        reranked_results.append(result)
+
+            logger.debug(
+                f"Reranked {len(search_results_dicts)} results in {reranking_time_ms:.1f}ms"
+            )
+
+            return reranked_results, reranking_time_ms
+
+        except Exception as e:
+            logger.warning(f"Reranking failed, continuing without reranking: {e}")
+            return None, None
 
     async def compare_search_methods(
         self,
