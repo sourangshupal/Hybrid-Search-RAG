@@ -38,37 +38,47 @@ class DocumentMetadataResponse(BaseModel):
     paper_metadata: Optional[PaperMetadata] = None
 
 
-class SearchResult(BaseModel):
+class SearchResultItem(BaseModel):
     """Model for a single search result."""
 
-    chunk_id: str
-    document_id: str
-    content: str
+    id: str
     score: float
+    content: str
     metadata: dict
-    highlights: Optional[list[str]] = None
+    rank: Optional[int] = None
+    explanation: Optional[str] = None
 
 
 class SearchResponse(BaseModel):
     """Response model for search queries."""
 
     query: str
-    results: list[SearchResult]
+    results: list[dict]  # SearchResultItem as dict
     total_results: int
     search_time_ms: float
-    search_type: str  # "semantic", "lexical", "hybrid"
+    fusion_method: Optional[str] = None
+    reranked: Optional[bool] = False
 
 
-class CitationSource(BaseModel):
-    """Model for citation source."""
+class CitationItem(BaseModel):
+    """Model for a single citation."""
 
-    chunk_id: str
-    document_id: str
-    title: Optional[str] = None
-    authors: Optional[list[str]] = None
-    year: Optional[int] = None
-    page: Optional[int] = None
-    excerpt: str
+    authors: str
+    year: str
+    title: str
+    venue: Optional[str] = None
+    doi: Optional[str] = None
+    arxiv_id: Optional[str] = None
+
+
+class SourceItem(BaseModel):
+    """Model for a source document."""
+
+    id: str
+    title: str
+    authors: str
+    year: Any  # Can be int or str
+    score: float
 
 
 class RAGQueryResponse(BaseModel):
@@ -76,12 +86,13 @@ class RAGQueryResponse(BaseModel):
 
     query: str
     answer: str
-    sources: list[CitationSource]
-    retrieval_count: int
+    citations: list[CitationItem] = Field(default_factory=list)
+    sources: list[SourceItem] = Field(default_factory=list)
+    model_used: str
+    search_time_ms: float
     generation_time_ms: float
     total_time_ms: float
-    model_used: str
-    confidence_score: Optional[float] = None
+    tokens_used: dict = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):
