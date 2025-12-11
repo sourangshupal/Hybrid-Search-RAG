@@ -1,0 +1,18 @@
+# Staging Environment Configuration
+
+environment: staging
+debug: false
+
+# API
+api_host: "0.0.0.0"
+api_port: 8000
+api_debug: false
+
+# Logging
+log_level: INFO
+log_format: json
+
+# Performance
+enable_cache: true
+cache_ttl: 7200
+rate_limit_per_minute: 120

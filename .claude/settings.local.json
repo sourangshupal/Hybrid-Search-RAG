@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(test:*)",
+      "Bash(chmod:*)",
+      "Bash(./scripts/setup_aws.sh:*)",
+      "Bash(aws s3:*)",
+      "Bash(aws secretsmanager describe-secret:*)",
+      "Bash(aws ecr describe-repositories:*)",
+      "Bash(git init:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(uv sync:*)",
+      "Bash(docker-compose up:*)"
+    ]
+  }
+}
