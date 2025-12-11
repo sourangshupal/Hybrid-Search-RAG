@@ -1,0 +1,100 @@
+# HorizontalPodAutoscaler for API
+#
+# Automatically scales API pods based on CPU/memory utilization
+# Requires metrics-server to be installed in the cluster
+#
+# Install metrics-server:
+# kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hybrid-rag-api-hpa
+  namespace: hybrid-rag
+  labels:
+    app: hybrid-rag-api
+    component: autoscaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hybrid-rag-api
+
+  minReplicas: 3
+  maxReplicas: 10
+
+  metrics:
+    # CPU utilization
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    # Memory utilization
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min
+
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+      selectPolicy: Max
+
+---
+# Custom metrics based HPA (requires Prometheus Adapter)
+# Uncomment if using custom metrics
+#
+# apiVersion: autoscaling/v2
+# kind: HorizontalPodAutoscaler
+# metadata:
+#   name: hybrid-rag-api-hpa-custom
+#   namespace: hybrid-rag
+# spec:
+#   scaleTargetRef:
+#     apiVersion: apps/v1
+#     kind: Deployment
+#     name: hybrid-rag-api
+#   minReplicas: 3
+#   maxReplicas: 15
+#   metrics:
+#     # Request rate
+#     - type: Pods
+#       pods:
+#         metric:
+#           name: http_requests_per_second
+#         target:
+#           type: AverageValue
+#           averageValue: "100"
+#
+#     # Request latency
+#     - type: Pods
+#       pods:
+#         metric:
+#           name: http_request_duration_p95
+#         target:
+#           type: AverageValue
+#           averageValue: "3000m"  # 3 seconds

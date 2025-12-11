@@ -1,0 +1,165 @@
+# Ingress with AWS Load Balancer Controller
+#
+# Prerequisites:
+# 1. Install AWS Load Balancer Controller:
+#    helm repo add eks https://aws.github.io/eks-charts
+#    helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+#      -n kube-system \
+#      --set clusterName=<cluster-name> \
+#      --set serviceAccount.create=false \
+#      --set serviceAccount.name=aws-load-balancer-controller
+#
+# 2. Create IAM policy and role for ALB controller
+# 3. Tag subnets for ALB discovery:
+#    - Public subnets: kubernetes.io/role/elb=1
+#    - Private subnets: kubernetes.io/role/internal-elb=1
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hybrid-rag-ingress
+  namespace: hybrid-rag
+  labels:
+    app: hybrid-rag-api
+    component: ingress
+  annotations:
+    # AWS Load Balancer Controller
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "10"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # Load balancer attributes
+    alb.ingress.kubernetes.io/load-balancer-attributes: |
+      idle_timeout.timeout_seconds=60,
+      deletion_protection.enabled=true,
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=hybrid-rag-logs-prod,
+      access_logs.s3.prefix=alb-logs
+
+    # Security
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS-1-2-2017-01
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+
+    # Certificate (replace with your ACM certificate ARN)
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:ACCOUNT_ID:certificate/CERTIFICATE_ID
+
+    # Target group attributes
+    alb.ingress.kubernetes.io/target-group-attributes: |
+      deregistration_delay.timeout_seconds=30,
+      stickiness.enabled=true,
+      stickiness.lb_cookie.duration_seconds=86400,
+      stickiness.type=lb_cookie
+
+    # WAF (optional - replace with your WAF ACL ARN)
+    # alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:us-east-1:ACCOUNT_ID:regional/webacl/NAME/ID
+
+    # Tags
+    alb.ingress.kubernetes.io/tags: |
+      Environment=production,
+      Project=hybrid-rag,
+      ManagedBy=kubernetes
+
+spec:
+  rules:
+    - host: api.hybrid-rag.example.com  # Replace with your domain
+      http:
+        paths:
+          # Health check endpoint
+          - path: /health
+            pathType: Exact
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8000
+
+          # Metrics endpoint
+          - path: /metrics
+            pathType: Exact
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8000
+
+          # API documentation
+          - path: /docs
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8000
+
+          - path: /redoc
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8000
+
+          # API endpoints
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8000
+
+          # Root
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8000
+
+---
+# Internal Ingress (for private VPC access)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hybrid-rag-ingress-internal
+  namespace: hybrid-rag
+  labels:
+    app: hybrid-rag-api
+    component: ingress-internal
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal  # Internal load balancer
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/backend-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/tags: |
+      Environment=production,
+      Project=hybrid-rag,
+      ManagedBy=kubernetes,
+      Visibility=internal
+
+spec:
+  rules:
+    - host: api-internal.hybrid-rag.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service
+                port:
+                  number: 8000

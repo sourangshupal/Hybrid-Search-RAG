@@ -1,0 +1,292 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hybrid-rag-api
+  namespace: hybrid-rag
+  labels:
+    app: hybrid-rag-api
+    component: api
+    version: v1.0.0
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: hybrid-rag-api
+      component: api
+  template:
+    metadata:
+      labels:
+        app: hybrid-rag-api
+        component: api
+        version: v1.0.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: hybrid-rag-api-sa
+
+      # Init container to wait for dependencies
+      initContainers:
+        - name: wait-for-qdrant
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z qdrant-service 6333; do
+                echo "Waiting for Qdrant..."
+                sleep 2
+              done
+              echo "Qdrant is ready"
+
+        - name: wait-for-elasticsearch
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z elasticsearch-service 9200; do
+                echo "Waiting for Elasticsearch..."
+                sleep 2
+              done
+              echo "Elasticsearch is ready"
+
+        - name: wait-for-redis
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z redis-service 6379; do
+                echo "Waiting for Redis..."
+                sleep 2
+              done
+              echo "Redis is ready"
+
+      containers:
+        - name: api
+          image: ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/hybrid-rag-api:latest
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            # From ConfigMap
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: ENVIRONMENT
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: LOG_LEVEL
+            - name: VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: VERSION
+
+            # Service endpoints
+            - name: QDRANT_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: QDRANT_HOST
+            - name: QDRANT_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: QDRANT_PORT
+            - name: ELASTICSEARCH_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: ELASTICSEARCH_HOST
+            - name: ELASTICSEARCH_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: ELASTICSEARCH_PORT
+            - name: REDIS_HOST
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: REDIS_HOST
+            - name: REDIS_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: REDIS_PORT
+
+            # AWS settings
+            - name: AWS_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: AWS_REGION
+            - name: AWS_S3_BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: AWS_S3_BUCKET
+
+            # Performance settings
+            - name: ENABLE_TRACING
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: ENABLE_TRACING
+            - name: ENABLE_COMET_TRACKING
+              valueFrom:
+                configMapKeyRef:
+                  name: hybrid-rag-config
+                  key: ENABLE_COMET_TRACKING
+
+            # API Keys from secrets
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: api-keys
+                  key: ANTHROPIC_API_KEY
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: api-keys
+                  key: OPENAI_API_KEY
+            - name: COHERE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: api-keys
+                  key: COHERE_API_KEY
+            - name: COMET_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: api-keys
+                  key: COMET_API_KEY
+                  optional: true
+
+            # AWS credentials from secrets
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_ACCESS_KEY_ID
+                  optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: aws-credentials
+                  key: AWS_SECRET_ACCESS_KEY
+                  optional: true
+
+            # Pod metadata
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+
+          volumeMounts:
+            - name: logs
+              mountPath: /app/logs
+            - name: data
+              mountPath: /app/data
+            - name: models
+              mountPath: /app/models
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+
+      volumes:
+        - name: logs
+          persistentVolumeClaim:
+            claimName: api-logs
+        - name: data
+          persistentVolumeClaim:
+            claimName: api-data
+        - name: models
+          persistentVolumeClaim:
+            claimName: api-models
+
+      # Scheduling
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - hybrid-rag-api
+                topologyKey: kubernetes.io/hostname
+
+      # Tolerations for node taints (if using spot instances)
+      # tolerations:
+      #   - key: "spot"
+      #     operator: "Equal"
+      #     value: "true"
+      #     effect: "NoSchedule"
+
+      terminationGracePeriodSeconds: 60

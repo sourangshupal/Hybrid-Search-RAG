@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: qdrant
+  namespace: hybrid-rag
+  labels:
+    app: qdrant
+    component: vector-database
+spec:
+  serviceName: qdrant-service
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qdrant
+      component: vector-database
+  template:
+    metadata:
+      labels:
+        app: qdrant
+        component: vector-database
+    spec:
+      containers:
+        - name: qdrant
+          image: qdrant/qdrant:v1.7.4
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 6333
+              protocol: TCP
+            - name: grpc
+              containerPort: 6334
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: qdrant-config
+
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "2Gi"
+            limits:
+              cpu: "2000m"
+              memory: "4Gi"
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          volumeMounts:
+            - name: qdrant-storage
+              mountPath: /qdrant/storage
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
+
+      volumes:
+        - name: qdrant-storage
+          persistentVolumeClaim:
+            claimName: qdrant-storage
+
+      terminationGracePeriodSeconds: 60

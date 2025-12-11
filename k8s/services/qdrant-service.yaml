@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant-service
+  namespace: hybrid-rag
+  labels:
+    app: qdrant
+    component: vector-database
+spec:
+  type: ClusterIP
+  selector:
+    app: qdrant
+    component: vector-database
+  ports:
+    - name: http
+      port: 6333
+      targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: 6334
+      targetPort: grpc
+      protocol: TCP
+  sessionAffinity: None
+
+---
+# Headless service for StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: qdrant-headless
+  namespace: hybrid-rag
+  labels:
+    app: qdrant
+    component: vector-database
+spec:
+  clusterIP: None
+  selector:
+    app: qdrant
+    component: vector-database
+  ports:
+    - name: http
+      port: 6333
+      targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: 6334
+      targetPort: grpc
+      protocol: TCP

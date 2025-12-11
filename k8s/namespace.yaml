@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hybrid-rag
+  labels:
+    name: hybrid-rag
+    environment: production
+    app: hybrid-search-rag
+    managed-by: kubectl
+  annotations:
+    description: "Hybrid Search RAG system for academic research papers"
+    contact: "devops@yourcompany.com"

@@ -1,0 +1,150 @@
+# PersistentVolumeClaims for stateful services
+#
+# Uses AWS EBS volumes via gp3 storage class
+# Supports dynamic provisioning with AWS EBS CSI Driver
+#
+# Prerequisites:
+# - AWS EBS CSI Driver installed on EKS cluster
+# - StorageClass 'gp3' configured (or use 'gp2' as fallback)
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: qdrant-storage
+  namespace: hybrid-rag
+  labels:
+    app: qdrant
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 50Gi
+  # Optional: volumeMode for block storage
+  volumeMode: Filesystem
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: elasticsearch-storage
+  namespace: hybrid-rag
+  labels:
+    app: elasticsearch
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 100Gi
+  volumeMode: Filesystem
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-storage
+  namespace: hybrid-rag
+  labels:
+    app: redis
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 20Gi
+  volumeMode: Filesystem
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: api-logs
+  namespace: hybrid-rag
+  labels:
+    app: hybrid-rag-api
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteMany  # Multiple pods can read/write
+  storageClassName: efs  # Use EFS for shared access
+  resources:
+    requests:
+      storage: 10Gi
+  volumeMode: Filesystem
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: api-data
+  namespace: hybrid-rag
+  labels:
+    app: hybrid-rag-api
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteMany  # Multiple pods can read/write
+  storageClassName: efs  # Use EFS for shared access
+  resources:
+    requests:
+      storage: 50Gi
+  volumeMode: Filesystem
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: api-models
+  namespace: hybrid-rag
+  labels:
+    app: hybrid-rag-api
+    component: storage
+spec:
+  accessModes:
+    - ReadWriteMany  # Multiple pods can read/write
+  storageClassName: efs  # Use EFS for shared model cache
+  resources:
+    requests:
+      storage: 30Gi
+  volumeMode: Filesystem
+
+---
+# StorageClass definitions (create if not exists)
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-XXXXXXXXX  # Replace with your EFS filesystem ID
+  directoryPerms: "700"
+  gidRangeStart: "1000"
+  gidRangeEnd: "2000"
+  basePath: "/hybrid-rag"
+volumeBindingMode: Immediate
+allowVolumeExpansion: true
