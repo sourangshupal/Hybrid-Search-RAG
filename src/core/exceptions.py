@@ -109,12 +109,22 @@ class RetrievalError(HybridRAGException):
     pass
 
 
-class QdrantError(RetrievalError):
+class VectorStoreError(RetrievalError):
+    """Error during vector store operations."""
+    pass
+
+
+class SearchEngineError(RetrievalError):
+    """Error during search engine operations."""
+    pass
+
+
+class QdrantError(VectorStoreError):
     """Error during Qdrant operations."""
     pass
 
 
-class ElasticsearchError(RetrievalError):
+class ElasticsearchError(SearchEngineError):
     """Error during Elasticsearch operations."""
     pass
 
