@@ -13,7 +13,13 @@
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(uv sync:*)",
-      "Bash(docker-compose up:*)"
+      "Bash(docker-compose up:*)",
+      "mcp__deepwiki__ask_question",
+      "Bash(source:*)",
+      "Bash(pytest:*)",
+      "Bash(python scripts/benchmark_embeddings.py:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(python -m pytest:*)"
     ]
   }
 }
