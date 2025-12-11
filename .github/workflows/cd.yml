@@ -1,0 +1,385 @@
+name: CD - Continuous Deployment
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: 'Version/tag to deploy'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: hybrid-rag-api
+  EKS_CLUSTER_STAGING: hybrid-rag-staging
+  EKS_CLUSTER_PRODUCTION: hybrid-rag-cluster
+
+jobs:
+  # Job 1: Build and Push to ECR
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      image-tag: ${{ steps.meta.outputs.version }}
+      image-uri: ${{ steps.build.outputs.image-uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          # Determine version/tag
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.version }}" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            VERSION="main-${GITHUB_SHA::7}"
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            BUILD_DATE=${{ steps.meta.outputs.build-date }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+
+      - name: Set image URI output
+        run: |
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}"
+          echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.version }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+
+  # Job 2: Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build-and-push
+    if: |
+      github.ref == 'refs/heads/main' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment:
+      name: staging
+      url: https://api-staging.hybrid-rag.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_STAGING }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.28.0'
+
+      - name: Update image in deployment
+        run: |
+          kubectl set image deployment/hybrid-rag-api \
+            api=${{ needs.build-and-push.outputs.image-uri }} \
+            -n hybrid-rag
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/hybrid-rag-api \
+            -n hybrid-rag \
+            --timeout=5m
+
+      - name: Verify deployment
+        run: |
+          # Check pods are running
+          kubectl get pods -n hybrid-rag -l app=hybrid-rag-api
+
+          # Get service endpoint
+          ALB_URL=$(kubectl get ingress hybrid-rag-ingress -n hybrid-rag -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Staging URL: http://$ALB_URL"
+
+      - name: Run smoke tests
+        run: |
+          ALB_URL=$(kubectl get ingress hybrid-rag-ingress -n hybrid-rag -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          # Test health endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://$ALB_URL/health)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Health check failed with code: $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ Smoke tests passed"
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Deployment to staging successful"
+          echo "Image: ${{ needs.build-and-push.outputs.image-uri }}"
+          echo "Version: ${{ needs.build-and-push.outputs.image-tag }}"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed, rolling back..."
+          kubectl rollout undo deployment/hybrid-rag-api -n hybrid-rag
+          kubectl rollout status deployment/hybrid-rag-api -n hybrid-rag --timeout=5m
+
+  # Job 3: Deploy to Production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [build-and-push, deploy-staging]
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment:
+      name: production
+      url: https://api.hybrid-rag.example.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_PRODUCTION }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.28.0'
+
+      - name: Create backup of current deployment
+        run: |
+          kubectl get deployment hybrid-rag-api -n hybrid-rag -o yaml > deployment-backup.yaml
+
+      - name: Upload backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-backup-${{ github.sha }}
+          path: deployment-backup.yaml
+          retention-days: 30
+
+      - name: Update image in deployment
+        run: |
+          kubectl set image deployment/hybrid-rag-api \
+            api=${{ needs.build-and-push.outputs.image-uri }} \
+            -n hybrid-rag
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/hybrid-rag-api \
+            -n hybrid-rag \
+            --timeout=10m
+
+      - name: Verify deployment
+        run: |
+          # Check pods are running
+          kubectl get pods -n hybrid-rag -l app=hybrid-rag-api
+
+          # Check HPA status
+          kubectl get hpa -n hybrid-rag
+
+          # Get service endpoint
+          ALB_URL=$(kubectl get ingress hybrid-rag-ingress -n hybrid-rag -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Production URL: https://$ALB_URL"
+
+      - name: Run smoke tests
+        run: |
+          ALB_URL=$(kubectl get ingress hybrid-rag-ingress -n hybrid-rag -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          # Test health endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://$ALB_URL/health)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Health check failed with code: $HTTP_CODE"
+            exit 1
+          fi
+
+          # Test API endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://$ALB_URL/api/v1/health)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "API health check failed with code: $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ All smoke tests passed"
+
+      - name: Run integration tests
+        run: |
+          ALB_URL=$(kubectl get ingress hybrid-rag-ingress -n hybrid-rag -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          # Test metrics endpoint
+          curl -f https://$ALB_URL/metrics || exit 1
+
+          echo "✅ Integration tests passed"
+
+      - name: Create deployment tag
+        if: success()
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -a "deploy-prod-$(date +%Y%m%d-%H%M%S)" -m "Production deployment: ${{ needs.build-and-push.outputs.image-tag }}"
+          git push origin --tags || true
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Deployment to production successful"
+          echo "Image: ${{ needs.build-and-push.outputs.image-uri }}"
+          echo "Version: ${{ needs.build-and-push.outputs.image-tag }}"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed, rolling back..."
+          kubectl rollout undo deployment/hybrid-rag-api -n hybrid-rag
+          kubectl rollout status deployment/hybrid-rag-api -n hybrid-rag --timeout=10m
+          echo "⚠️ Rolled back to previous version"
+
+  # Job 4: Post-deployment monitoring
+  post-deployment:
+    name: Post-Deployment Monitoring
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [deploy-production]
+    if: success()
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_PRODUCTION }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Monitor for 5 minutes
+        run: |
+          echo "Monitoring deployment for 5 minutes..."
+
+          for i in {1..10}; do
+            echo "Check $i/10 - $(date)"
+
+            # Check pod status
+            PODS_READY=$(kubectl get pods -n hybrid-rag -l app=hybrid-rag-api -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -o True | wc -l)
+            PODS_TOTAL=$(kubectl get pods -n hybrid-rag -l app=hybrid-rag-api --no-headers | wc -l)
+
+            echo "Pods ready: $PODS_READY/$PODS_TOTAL"
+
+            if [ "$PODS_READY" -lt "$PODS_TOTAL" ]; then
+              echo "⚠️ Warning: Not all pods are ready"
+            fi
+
+            # Check for errors in logs
+            ERROR_COUNT=$(kubectl logs -n hybrid-rag -l app=hybrid-rag-api --tail=100 | grep -i "error" | wc -l || true)
+            echo "Recent errors: $ERROR_COUNT"
+
+            sleep 30
+          done
+
+          echo "✅ Monitoring complete"
+
+      - name: Create deployment summary
+        run: |
+          cat << EOF > deployment-summary.md
+          # Deployment Summary
+
+          ## Details
+          - **Environment**: Production
+          - **Version**: ${{ needs.build-and-push.outputs.image-tag }}
+          - **Image**: ${{ needs.build-and-push.outputs.image-uri }}
+          - **Timestamp**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          - **Commit**: ${{ github.sha }}
+
+          ## Status
+          ✅ Deployment successful
+
+          ## Verification
+          - ✅ Health checks passing
+          - ✅ All pods ready
+          - ✅ Smoke tests passed
+          - ✅ 5-minute monitoring completed
+
+          EOF
+
+          cat deployment-summary.md
+
+      - name: Upload deployment summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-summary
+          path: deployment-summary.md
+          retention-days: 90

@@ -1,0 +1,174 @@
+name: Rollback Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to rollback'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      revision:
+        description: 'Revision to rollback to (leave empty for previous)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_STAGING: hybrid-rag-staging
+  EKS_CLUSTER_PRODUCTION: hybrid-rag-cluster
+
+jobs:
+  rollback:
+    name: Rollback to Previous Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Validate environment
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" != "staging" && "${{ github.event.inputs.environment }}" != "production" ]]; then
+            echo "Invalid environment: ${{ github.event.inputs.environment }}"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine cluster name
+        id: cluster
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" == "production" ]]; then
+            echo "name=${{ env.EKS_CLUSTER_PRODUCTION }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${{ env.EKS_CLUSTER_STAGING }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ steps.cluster.outputs.name }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.28.0'
+
+      - name: Get current deployment info
+        run: |
+          echo "Current deployment status:"
+          kubectl get deployment hybrid-rag-api -n hybrid-rag -o wide
+
+          echo ""
+          echo "Rollout history:"
+          kubectl rollout history deployment/hybrid-rag-api -n hybrid-rag
+
+      - name: Perform rollback
+        run: |
+          if [ -n "${{ github.event.inputs.revision }}" ]; then
+            echo "Rolling back to revision ${{ github.event.inputs.revision }}"
+            kubectl rollout undo deployment/hybrid-rag-api \
+              -n hybrid-rag \
+              --to-revision=${{ github.event.inputs.revision }}
+          else
+            echo "Rolling back to previous revision"
+            kubectl rollout undo deployment/hybrid-rag-api -n hybrid-rag
+          fi
+
+      - name: Wait for rollback to complete
+        run: |
+          kubectl rollout status deployment/hybrid-rag-api \
+            -n hybrid-rag \
+            --timeout=10m
+
+      - name: Verify rollback
+        run: |
+          echo "Deployment after rollback:"
+          kubectl get deployment hybrid-rag-api -n hybrid-rag -o wide
+
+          echo ""
+          echo "Pods status:"
+          kubectl get pods -n hybrid-rag -l app=hybrid-rag-api
+
+      - name: Run health checks
+        run: |
+          ALB_URL=$(kubectl get ingress hybrid-rag-ingress -n hybrid-rag -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          # Wait for ALB to update
+          sleep 30
+
+          # Test health endpoint
+          PROTOCOL="http"
+          if [[ "${{ github.event.inputs.environment }}" == "production" ]]; then
+            PROTOCOL="https"
+          fi
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" $PROTOCOL://$ALB_URL/health)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Health check failed with code: $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ Health check passed"
+
+      - name: Create rollback summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+
+          cat << EOF > rollback-summary.md
+          # Rollback Summary
+
+          ## Details
+          - **Environment**: ${{ github.event.inputs.environment }}
+          - **Timestamp**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          - **Triggered by**: ${{ github.actor }}
+          - **Revision**: ${{ github.event.inputs.revision || 'Previous' }}
+          - **Status**: $STATUS
+
+          ## Current Deployment
+          \`\`\`
+          $(kubectl get deployment hybrid-rag-api -n hybrid-rag -o wide)
+          \`\`\`
+
+          ## Pods Status
+          \`\`\`
+          $(kubectl get pods -n hybrid-rag -l app=hybrid-rag-api)
+          \`\`\`
+
+          ## Rollout History
+          \`\`\`
+          $(kubectl rollout history deployment/hybrid-rag-api -n hybrid-rag)
+          \`\`\`
+          EOF
+
+          cat rollback-summary.md
+
+      - name: Upload rollback summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-summary-${{ github.run_id }}
+          path: rollback-summary.md
+          retention-days: 90
+
+      - name: Notify success
+        if: success()
+        run: |
+          echo "✅ Rollback completed successfully"
+          echo "Environment: ${{ github.event.inputs.environment }}"
+
+      - name: Notify failure
+        if: failure()
+        run: |
+          echo "❌ Rollback failed"
+          echo "Please check the logs and perform manual rollback if necessary"

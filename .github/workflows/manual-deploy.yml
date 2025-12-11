@@ -1,0 +1,197 @@
+name: Manual Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      image-tag:
+        description: 'Docker image tag to deploy'
+        required: true
+        type: string
+      skip-tests:
+        description: 'Skip smoke tests'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: hybrid-rag-api
+  EKS_CLUSTER_STAGING: hybrid-rag-staging
+  EKS_CLUSTER_PRODUCTION: hybrid-rag-cluster
+
+jobs:
+  validate-image:
+    name: Validate Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image-uri: ${{ steps.check.outputs.image-uri }}
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Check if image exists
+        id: check
+        run: |
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.inputs.image-tag }}"
+
+          if aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-ids imageTag=${{ github.event.inputs.image-tag }} \
+            --region ${{ env.AWS_REGION }} > /dev/null 2>&1; then
+            echo "✅ Image exists: $IMAGE_URI"
+            echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Image not found: $IMAGE_URI"
+            exit 1
+          fi
+
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: validate-image
+    environment:
+      name: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Determine cluster name
+        id: cluster
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" == "production" ]]; then
+            echo "name=${{ env.EKS_CLUSTER_PRODUCTION }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${{ env.EKS_CLUSTER_STAGING }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ steps.cluster.outputs.name }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.28.0'
+
+      - name: Create deployment backup
+        run: |
+          kubectl get deployment hybrid-rag-api -n hybrid-rag -o yaml > deployment-backup.yaml
+
+      - name: Upload backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-backup-${{ github.run_id }}
+          path: deployment-backup.yaml
+          retention-days: 30
+
+      - name: Update deployment
+        run: |
+          echo "Deploying image: ${{ needs.validate-image.outputs.image-uri }}"
+
+          kubectl set image deployment/hybrid-rag-api \
+            api=${{ needs.validate-image.outputs.image-uri }} \
+            -n hybrid-rag \
+            --record
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/hybrid-rag-api \
+            -n hybrid-rag \
+            --timeout=10m
+
+      - name: Verify deployment
+        run: |
+          kubectl get deployment hybrid-rag-api -n hybrid-rag -o wide
+          kubectl get pods -n hybrid-rag -l app=hybrid-rag-api
+
+      - name: Run smoke tests
+        if: ${{ !github.event.inputs.skip-tests }}
+        run: |
+          ALB_URL=$(kubectl get ingress hybrid-rag-ingress -n hybrid-rag -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
+          PROTOCOL="http"
+          if [[ "${{ github.event.inputs.environment }}" == "production" ]]; then
+            PROTOCOL="https"
+          fi
+
+          # Wait for ALB to update
+          sleep 30
+
+          # Health check
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" $PROTOCOL://$ALB_URL/health)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "❌ Health check failed with code: $HTTP_CODE"
+            exit 1
+          fi
+
+          echo "✅ Smoke tests passed"
+
+      - name: Create deployment summary
+        if: always()
+        run: |
+          cat << EOF > deployment-summary.md
+          # Manual Deployment Summary
+
+          ## Details
+          - **Environment**: ${{ github.event.inputs.environment }}
+          - **Image Tag**: ${{ github.event.inputs.image-tag }}
+          - **Image URI**: ${{ needs.validate-image.outputs.image-uri }}
+          - **Triggered by**: ${{ github.actor }}
+          - **Timestamp**: $(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          - **Status**: ${{ job.status }}
+
+          ## Deployment Status
+          \`\`\`
+          $(kubectl get deployment hybrid-rag-api -n hybrid-rag -o wide)
+          \`\`\`
+
+          ## Pods
+          \`\`\`
+          $(kubectl get pods -n hybrid-rag -l app=hybrid-rag-api)
+          \`\`\`
+          EOF
+
+          cat deployment-summary.md
+
+      - name: Upload summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-summary-${{ github.run_id }}
+          path: deployment-summary.md
+          retention-days: 90
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed, rolling back..."
+          kubectl rollout undo deployment/hybrid-rag-api -n hybrid-rag
+          kubectl rollout status deployment/hybrid-rag-api -n hybrid-rag --timeout=10m
