@@ -1,0 +1,115 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+dist
+build
+.eggs
+*.egg
+.venv
+venv
+env
+ENV
+
+# Testing
+.pytest_cache
+.coverage
+htmlcov
+.tox
+.hypothesis
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Documentation
+docs/_build
+*.md
+!README.md
+
+# Notebooks
+notebooks
+*.ipynb
+.ipynb_checkpoints
+
+# Data and models
+data
+models
+*.pkl
+*.pth
+*.pt
+*.h5
+*.onnx
+
+# Logs
+logs
+*.log
+
+# Temporary files
+tmp
+temp
+*.tmp
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Docker
+docker-compose.yml
+docker-compose.*.yml
+!docker-compose.prod.yml
+Dockerfile.*
+.dockerignore
+
+# CI/CD
+.github
+.gitlab-ci.yml
+.travis.yml
+
+# Tests
+tests
+test_*.py
+*_test.py
+
+# Evaluation
+evaluation_dataset.json
+evaluation_results.json
+*.csv
+
+# Build artifacts
+*.tar.gz
+*.zip
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Locust
+locustfile.py
+
+# K8s
+k8s
+*.yaml
+*.yml
+!docker-compose.prod.yml
+
+# Scripts (only include necessary ones)
+scripts/generate_eval_dataset.py
+scripts/run_evaluation.py
+
+# Coverage reports
+.coverage.*
+coverage.xml
